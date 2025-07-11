@@ -9,11 +9,20 @@
 (define-constant ERR_ALREADY_MEMBER (err u107))
 (define-constant ERR_INVALID_AMOUNT (err u108))
 (define-constant ERR_PROPERTY_ALREADY_EXISTS (err u109))
+(define-constant ERR_PROPERTY_NOT_RENTABLE (err u110))
+(define-constant ERR_TENANT_NOT_FOUND (err u111))
+(define-constant ERR_RENTAL_ALREADY_ACTIVE (err u112))
+(define-constant ERR_RENTAL_NOT_ACTIVE (err u113))
+(define-constant ERR_RENT_NOT_DUE (err u114))
+(define-constant ERR_INVALID_RENT_AMOUNT (err u115))
+(define-constant ERR_TENANT_ALREADY_EXISTS (err u116))
 
 (define-data-var next-property-id uint u1)
 (define-data-var next-proposal-id uint u1)
+(define-data-var next-rental-id uint u1)
 (define-data-var total-members uint u0)
 (define-data-var treasury-balance uint u0)
+(define-data-var total-rental-income uint u0)
 
 (define-map members principal bool)
 (define-map member-shares principal uint)
@@ -56,6 +65,58 @@
   bool
 )
 
+(define-map rental-contracts
+  uint
+  {
+    property-id: uint,
+    tenant: principal,
+    monthly-rent: uint,
+    security-deposit: uint,
+    lease-start: uint,
+    lease-end: uint,
+    is-active: bool,
+    total-rent-paid: uint,
+    last-payment-block: uint,
+    next-payment-due: uint
+  }
+)
+
+(define-map property-rentals
+  uint
+  {
+    is-rentable: bool,
+    current-rental-id: (optional uint),
+    total-rental-income: uint,
+    rental-history-count: uint
+  }
+)
+
+(define-map tenant-profiles
+  principal
+  {
+    total-rentals: uint,
+    total-rent-paid: uint,
+    current-rentals: uint,
+    reputation-score: uint,
+    last-rental-end: uint
+  }
+)
+
+(define-map rental-payments
+  { rental-id: uint, payment-number: uint }
+  {
+    amount: uint,
+    payment-block: uint,
+    late-fee: uint,
+    is-late: bool
+  }
+)
+
+(define-map shareholder-earnings
+  { property-id: uint, member: principal }
+  uint
+)
+
 (define-public (join-dao (contribution uint))
   (let
     (
@@ -90,6 +151,14 @@
         is-available: true,
         total-shares: u0,
         created-at: stacks-block-height
+      }
+    )
+    (map-set property-rentals property-id
+      {
+        is-rentable: true,
+        current-rental-id: none,
+        total-rental-income: u0,
+        rental-history-count: u0
       }
     )
     (var-set next-property-id (+ property-id u1))
@@ -203,6 +272,196 @@
   )
 )
 
+(define-public (create-rental-contract (property-id uint) (tenant principal) (monthly-rent uint) (security-deposit uint) (lease-duration-blocks uint))
+  (let
+    (
+      (rental-id (var-get next-rental-id))
+      (sender tx-sender)
+      (property (unwrap! (map-get? properties property-id) ERR_PROPERTY_NOT_FOUND))
+      (property-rental (unwrap! (map-get? property-rentals property-id) ERR_PROPERTY_NOT_FOUND))
+      (tenant-profile (default-to
+        {
+          total-rentals: u0,
+          total-rent-paid: u0,
+          current-rentals: u0,
+          reputation-score: u100,
+          last-rental-end: u0
+        }
+        (map-get? tenant-profiles tenant)
+      ))
+    )
+    (asserts! (is-member-check sender) ERR_NOT_MEMBER)
+    (asserts! (get is-available property) ERR_PROPERTY_NOT_RENTABLE)
+    (asserts! (get is-rentable property-rental) ERR_PROPERTY_NOT_RENTABLE)
+    (asserts! (is-none (get current-rental-id property-rental)) ERR_RENTAL_ALREADY_ACTIVE)
+    (asserts! (> monthly-rent u0) ERR_INVALID_RENT_AMOUNT)
+    (asserts! (> security-deposit u0) ERR_INVALID_AMOUNT)
+    (asserts! (> lease-duration-blocks u0) ERR_INVALID_AMOUNT)
+    (try! (stx-transfer? security-deposit tenant (as-contract tx-sender)))
+    (map-set rental-contracts rental-id
+      {
+        property-id: property-id,
+        tenant: tenant,
+        monthly-rent: monthly-rent,
+        security-deposit: security-deposit,
+        lease-start: stacks-block-height,
+        lease-end: (+ stacks-block-height lease-duration-blocks),
+        is-active: true,
+        total-rent-paid: u0,
+        last-payment-block: u0,
+        next-payment-due: (+ stacks-block-height u144)
+      }
+    )
+    (map-set property-rentals property-id
+      (merge property-rental 
+        { 
+          current-rental-id: (some rental-id),
+          rental-history-count: (+ (get rental-history-count property-rental) u1)
+        }
+      )
+    )
+    (map-set tenant-profiles tenant
+      (merge tenant-profile
+        {
+          total-rentals: (+ (get total-rentals tenant-profile) u1),
+          current-rentals: (+ (get current-rentals tenant-profile) u1)
+        }
+      )
+    )
+    (var-set next-rental-id (+ rental-id u1))
+    (ok rental-id)
+  )
+)
+
+(define-public (pay-rent (rental-id uint))
+  (let
+    (
+      (sender tx-sender)
+      (rental (unwrap! (map-get? rental-contracts rental-id) ERR_TENANT_NOT_FOUND))
+      (property-rental (unwrap! (map-get? property-rentals (get property-id rental)) ERR_PROPERTY_NOT_FOUND))
+      (payment-number (+ (/ (get total-rent-paid rental) (get monthly-rent rental)) u1))
+      (is-late (> stacks-block-height (get next-payment-due rental)))
+      (late-fee (if is-late (/ (get monthly-rent rental) u10) u0))
+      (total-payment (+ (get monthly-rent rental) late-fee))
+    )
+    (asserts! (is-eq sender (get tenant rental)) ERR_NOT_AUTHORIZED)
+    (asserts! (get is-active rental) ERR_RENTAL_NOT_ACTIVE)
+    (asserts! (<= stacks-block-height (get lease-end rental)) ERR_RENTAL_NOT_ACTIVE)
+    (try! (stx-transfer? total-payment sender (as-contract tx-sender)))
+    (map-set rental-payments 
+      { rental-id: rental-id, payment-number: payment-number }
+      {
+        amount: total-payment,
+        payment-block: stacks-block-height,
+        late-fee: late-fee,
+        is-late: is-late
+      }
+    )
+    (map-set rental-contracts rental-id
+      (merge rental
+        {
+          total-rent-paid: (+ (get total-rent-paid rental) total-payment),
+          last-payment-block: stacks-block-height,
+          next-payment-due: (+ stacks-block-height u144)
+        }
+      )
+    )
+    (map-set property-rentals (get property-id rental)
+      (merge property-rental
+        {
+          total-rental-income: (+ (get total-rental-income property-rental) total-payment)
+        }
+      )
+    )
+    (var-set total-rental-income (+ (var-get total-rental-income) total-payment))
+    (try! (distribute-rent-to-shareholders (get property-id rental) total-payment))
+    (ok true)
+  )
+)
+
+(define-public (terminate-rental-contract (rental-id uint))
+  (let
+    (
+      (sender tx-sender)
+      (rental (unwrap! (map-get? rental-contracts rental-id) ERR_TENANT_NOT_FOUND))
+      (property-rental (unwrap! (map-get? property-rentals (get property-id rental)) ERR_PROPERTY_NOT_FOUND))
+      (tenant-profile (unwrap! (map-get? tenant-profiles (get tenant rental)) ERR_TENANT_NOT_FOUND))
+    )
+    (asserts! (is-member-check sender) ERR_NOT_MEMBER)
+    (asserts! (get is-active rental) ERR_RENTAL_NOT_ACTIVE)
+    (try! (as-contract (stx-transfer? (get security-deposit rental) tx-sender (get tenant rental))))
+    (map-set rental-contracts rental-id
+      (merge rental { is-active: false })
+    )
+    (map-set property-rentals (get property-id rental)
+      (merge property-rental { current-rental-id: none })
+    )
+    (map-set tenant-profiles (get tenant rental)
+      (merge tenant-profile
+        {
+          current-rentals: (- (get current-rentals tenant-profile) u1),
+          last-rental-end: stacks-block-height
+        }
+      )
+    )
+    (ok true)
+  )
+)
+
+(define-private (distribute-rent-to-shareholders (property-id uint) (rent-amount uint))
+  (let
+    (
+      (property (unwrap! (map-get? properties property-id) ERR_PROPERTY_NOT_FOUND))
+      (total-shares (get total-shares property))
+    )
+    (if (> total-shares u0)
+      (distribute-to-all-shareholders property-id rent-amount total-shares)
+      (ok true)
+    )
+  )
+)
+
+(define-private (distribute-to-all-shareholders (property-id uint) (rent-amount uint) (total-shares uint))
+  (let
+    (
+      (distribution-per-share (/ rent-amount total-shares))
+    )
+    (var-set treasury-balance (+ (var-get treasury-balance) rent-amount))
+    (ok true)
+  )
+)
+
+(define-public (claim-rental-earnings (property-id uint))
+  (let
+    (
+      (sender tx-sender)
+      (shareholder-shares (get-property-shares property-id sender))
+      (current-earnings (default-to u0 (map-get? shareholder-earnings { property-id: property-id, member: sender })))
+    )
+    (asserts! (is-member-check sender) ERR_NOT_MEMBER)
+    (asserts! (> shareholder-shares u0) ERR_NOT_AUTHORIZED)
+    (asserts! (> current-earnings u0) ERR_INSUFFICIENT_FUNDS)
+    (try! (as-contract (stx-transfer? current-earnings tx-sender sender)))
+    (map-set shareholder-earnings { property-id: property-id, member: sender } u0)
+    (ok current-earnings)
+  )
+)
+
+(define-public (update-tenant-reputation (tenant principal) (new-score uint))
+  (let
+    (
+      (sender tx-sender)
+      (tenant-profile (unwrap! (map-get? tenant-profiles tenant) ERR_TENANT_NOT_FOUND))
+    )
+    (asserts! (is-member-check sender) ERR_NOT_MEMBER)
+    (asserts! (<= new-score u100) ERR_INVALID_AMOUNT)
+    (map-set tenant-profiles tenant
+      (merge tenant-profile { reputation-score: new-score })
+    )
+    (ok true)
+  )
+)
+
 (define-read-only (get-property (property-id uint))
   (map-get? properties property-id)
 )
@@ -241,6 +500,34 @@
 
 (define-read-only (get-next-proposal-id)
   (var-get next-proposal-id)
+)
+
+(define-read-only (get-rental-contract (rental-id uint))
+  (map-get? rental-contracts rental-id)
+)
+
+(define-read-only (get-property-rental-info (property-id uint))
+  (map-get? property-rentals property-id)
+)
+
+(define-read-only (get-tenant-profile (tenant principal))
+  (map-get? tenant-profiles tenant)
+)
+
+(define-read-only (get-rental-payment (rental-id uint) (payment-number uint))
+  (map-get? rental-payments { rental-id: rental-id, payment-number: payment-number })
+)
+
+(define-read-only (get-shareholder-earnings (property-id uint) (member principal))
+  (default-to u0 (map-get? shareholder-earnings { property-id: property-id, member: member }))
+)
+
+(define-read-only (get-total-rental-income)
+  (var-get total-rental-income)
+)
+
+(define-read-only (get-next-rental-id)
+  (var-get next-rental-id)
 )
 
 (define-private (is-member-check (member principal))
