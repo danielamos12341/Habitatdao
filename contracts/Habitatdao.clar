@@ -16,13 +16,24 @@
 (define-constant ERR_RENT_NOT_DUE (err u114))
 (define-constant ERR_INVALID_RENT_AMOUNT (err u115))
 (define-constant ERR_TENANT_ALREADY_EXISTS (err u116))
+(define-constant ERR_LISTING_NOT_FOUND (err u117))
+(define-constant ERR_INSUFFICIENT_SHARES (err u118))
+(define-constant ERR_INVALID_PRICE (err u119))
+(define-constant ERR_CANNOT_BUY_OWN_LISTING (err u120))
+(define-constant ERR_LISTING_EXPIRED (err u121))
+(define-constant ERR_TRADE_ORDER_NOT_FOUND (err u122))
+(define-constant ERR_INVALID_TRADE_AMOUNT (err u123))
 
 (define-data-var next-property-id uint u1)
 (define-data-var next-proposal-id uint u1)
 (define-data-var next-rental-id uint u1)
+(define-data-var next-listing-id uint u1)
+(define-data-var next-trade-id uint u1)
 (define-data-var total-members uint u0)
 (define-data-var treasury-balance uint u0)
 (define-data-var total-rental-income uint u0)
+(define-data-var total-trading-volume uint u0)
+(define-data-var trading-fee-rate uint u25)
 
 (define-map members principal bool)
 (define-map member-shares principal uint)
@@ -117,6 +128,58 @@
   uint
 )
 
+(define-map share-listings
+  uint
+  {
+    property-id: uint,
+    seller: principal,
+    shares-amount: uint,
+    price-per-share: uint,
+    total-price: uint,
+    expires-at: uint,
+    is-active: bool,
+    created-at: uint
+  }
+)
+
+(define-map trade-orders
+  uint
+  {
+    listing-id: uint,
+    buyer: principal,
+    seller: principal,
+    property-id: uint,
+    shares-traded: uint,
+    price-per-share: uint,
+    total-amount: uint,
+    trading-fee: uint,
+    executed-at: uint
+  }
+)
+
+(define-map property-trading-stats
+  uint
+  {
+    total-trades: uint,
+    total-volume: uint,
+    last-trade-price: uint,
+    highest-price: uint,
+    lowest-price: uint,
+    active-listings: uint
+  }
+)
+
+(define-map member-trading-history
+  principal
+  {
+    total-trades: uint,
+    total-bought: uint,
+    total-sold: uint,
+    total-fees-paid: uint,
+    last-trade-block: uint
+  }
+)
+
 (define-public (join-dao (contribution uint))
   (let
     (
@@ -159,6 +222,16 @@
         current-rental-id: none,
         total-rental-income: u0,
         rental-history-count: u0
+      }
+    )
+    (map-set property-trading-stats property-id
+      {
+        total-trades: u0,
+        total-volume: u0,
+        last-trade-price: u0,
+        highest-price: u0,
+        lowest-price: u0,
+        active-listings: u0
       }
     )
     (var-set next-property-id (+ property-id u1))
@@ -462,6 +535,208 @@
   )
 )
 
+(define-public (create-share-listing (property-id uint) (shares-amount uint) (price-per-share uint) (listing-duration-blocks uint))
+  (let
+    (
+      (listing-id (var-get next-listing-id))
+      (sender tx-sender)
+      (current-shares (get-property-shares property-id sender))
+      (total-price (* shares-amount price-per-share))
+      (trading-stats (unwrap! (map-get? property-trading-stats property-id) ERR_PROPERTY_NOT_FOUND))
+    )
+    (asserts! (is-member-check sender) ERR_NOT_MEMBER)
+    (asserts! (> shares-amount u0) ERR_INVALID_TRADE_AMOUNT)
+    (asserts! (> price-per-share u0) ERR_INVALID_PRICE)
+    (asserts! (>= current-shares shares-amount) ERR_INSUFFICIENT_SHARES)
+    (asserts! (> listing-duration-blocks u0) ERR_INVALID_AMOUNT)
+    (map-set share-listings listing-id
+      {
+        property-id: property-id,
+        seller: sender,
+        shares-amount: shares-amount,
+        price-per-share: price-per-share,
+        total-price: total-price,
+        expires-at: (+ stacks-block-height listing-duration-blocks),
+        is-active: true,
+        created-at: stacks-block-height
+      }
+    )
+    (map-set property-trading-stats property-id
+      (merge trading-stats 
+        { active-listings: (+ (get active-listings trading-stats) u1) }
+      )
+    )
+    (var-set next-listing-id (+ listing-id u1))
+    (ok listing-id)
+  )
+)
+
+(define-public (cancel-share-listing (listing-id uint))
+  (let
+    (
+      (sender tx-sender)
+      (listing (unwrap! (map-get? share-listings listing-id) ERR_LISTING_NOT_FOUND))
+      (trading-stats (unwrap! (map-get? property-trading-stats (get property-id listing)) ERR_PROPERTY_NOT_FOUND))
+    )
+    (asserts! (is-eq sender (get seller listing)) ERR_NOT_AUTHORIZED)
+    (asserts! (get is-active listing) ERR_LISTING_NOT_FOUND)
+    (map-set share-listings listing-id
+      (merge listing { is-active: false })
+    )
+    (map-set property-trading-stats (get property-id listing)
+      (merge trading-stats
+        { active-listings: (- (get active-listings trading-stats) u1) }
+      )
+    )
+    (ok true)
+  )
+)
+
+(define-public (buy-shares (listing-id uint) (shares-to-buy uint))
+  (let
+    (
+      (trade-id (var-get next-trade-id))
+      (buyer tx-sender)
+      (listing (unwrap! (map-get? share-listings listing-id) ERR_LISTING_NOT_FOUND))
+      (seller (get seller listing))
+      (property-id (get property-id listing))
+      (price-per-share (get price-per-share listing))
+      (total-cost (* shares-to-buy price-per-share))
+      (trading-fee (/ (* total-cost (var-get trading-fee-rate)) u10000))
+      (seller-amount (- total-cost trading-fee))
+      (trading-stats (unwrap! (map-get? property-trading-stats property-id) ERR_PROPERTY_NOT_FOUND))
+      (buyer-history (default-to
+        {
+          total-trades: u0,
+          total-bought: u0,
+          total-sold: u0,
+          total-fees-paid: u0,
+          last-trade-block: u0
+        }
+        (map-get? member-trading-history buyer)
+      ))
+      (seller-history (default-to
+        {
+          total-trades: u0,
+          total-bought: u0,
+          total-sold: u0,
+          total-fees-paid: u0,
+          last-trade-block: u0
+        }
+        (map-get? member-trading-history seller)
+      ))
+    )
+    (asserts! (is-member-check buyer) ERR_NOT_MEMBER)
+    (asserts! (not (is-eq buyer seller)) ERR_CANNOT_BUY_OWN_LISTING)
+    (asserts! (get is-active listing) ERR_LISTING_NOT_FOUND)
+    (asserts! (< stacks-block-height (get expires-at listing)) ERR_LISTING_EXPIRED)
+    (asserts! (> shares-to-buy u0) ERR_INVALID_TRADE_AMOUNT)
+    (asserts! (<= shares-to-buy (get shares-amount listing)) ERR_INSUFFICIENT_SHARES)
+    (try! (stx-transfer? total-cost buyer (as-contract tx-sender)))
+    (try! (as-contract (stx-transfer? seller-amount tx-sender seller)))
+    (try! (transfer-property-shares property-id seller buyer shares-to-buy))
+    (map-set trade-orders trade-id
+      {
+        listing-id: listing-id,
+        buyer: buyer,
+        seller: seller,
+        property-id: property-id,
+        shares-traded: shares-to-buy,
+        price-per-share: price-per-share,
+        total-amount: total-cost,
+        trading-fee: trading-fee,
+        executed-at: stacks-block-height
+      }
+    )
+    (if (is-eq shares-to-buy (get shares-amount listing))
+      (map-set share-listings listing-id
+        (merge listing { is-active: false, shares-amount: u0 })
+      )
+      (map-set share-listings listing-id
+        (merge listing 
+          { 
+            shares-amount: (- (get shares-amount listing) shares-to-buy),
+            total-price: (* (- (get shares-amount listing) shares-to-buy) price-per-share)
+          }
+        )
+      )
+    )
+    (map-set property-trading-stats property-id
+      (merge trading-stats
+        {
+          total-trades: (+ (get total-trades trading-stats) u1),
+          total-volume: (+ (get total-volume trading-stats) total-cost),
+          last-trade-price: price-per-share,
+          highest-price: (if (> price-per-share (get highest-price trading-stats)) 
+                          price-per-share 
+                          (get highest-price trading-stats)),
+          lowest-price: (if (or (is-eq (get lowest-price trading-stats) u0) 
+                               (< price-per-share (get lowest-price trading-stats))) 
+                         price-per-share 
+                         (get lowest-price trading-stats)),
+          active-listings: (if (is-eq shares-to-buy (get shares-amount listing))
+                            (- (get active-listings trading-stats) u1)
+                            (get active-listings trading-stats))
+        }
+      )
+    )
+    (map-set member-trading-history buyer
+      (merge buyer-history
+        {
+          total-trades: (+ (get total-trades buyer-history) u1),
+          total-bought: (+ (get total-bought buyer-history) total-cost),
+          total-fees-paid: (+ (get total-fees-paid buyer-history) trading-fee),
+          last-trade-block: stacks-block-height
+        }
+      )
+    )
+    (map-set member-trading-history seller
+      (merge seller-history
+        {
+          total-trades: (+ (get total-trades seller-history) u1),
+          total-sold: (+ (get total-sold seller-history) seller-amount),
+          last-trade-block: stacks-block-height
+        }
+      )
+    )
+    (var-set total-trading-volume (+ (var-get total-trading-volume) total-cost))
+    (var-set treasury-balance (+ (var-get treasury-balance) trading-fee))
+    (var-set next-trade-id (+ trade-id u1))
+    (ok trade-id)
+  )
+)
+
+(define-private (transfer-property-shares (property-id uint) (from principal) (to principal) (shares uint))
+  (let
+    (
+      (from-shares (get-property-shares property-id from))
+      (to-shares (get-property-shares property-id to))
+    )
+    (asserts! (>= from-shares shares) ERR_INSUFFICIENT_SHARES)
+    (map-set property-shareholders 
+      { property-id: property-id, member: from }
+      (- from-shares shares)
+    )
+    (map-set property-shareholders 
+      { property-id: property-id, member: to }
+      (+ to-shares shares)
+    )
+    (ok true)
+  )
+)
+
+(define-public (update-trading-fee-rate (new-rate uint))
+  (let
+    (
+      (sender tx-sender)
+    )
+    (asserts! (is-eq sender (get owner (unwrap! (map-get? properties u1) ERR_NOT_AUTHORIZED))) ERR_NOT_AUTHORIZED)
+    (asserts! (<= new-rate u1000) ERR_INVALID_AMOUNT)
+    (var-set trading-fee-rate new-rate)
+    (ok true)
+  )
+)
+
 (define-read-only (get-property (property-id uint))
   (map-get? properties property-id)
 )
@@ -530,6 +805,40 @@
   (var-get next-rental-id)
 )
 
+(define-read-only (get-share-listing (listing-id uint))
+  (map-get? share-listings listing-id)
+)
+
+(define-read-only (get-trade-order (trade-id uint))
+  (map-get? trade-orders trade-id)
+)
+
+(define-read-only (get-property-trading-stats (property-id uint))
+  (map-get? property-trading-stats property-id)
+)
+
+(define-read-only (get-member-trading-history (member principal))
+  (map-get? member-trading-history member)
+)
+
+(define-read-only (get-total-trading-volume)
+  (var-get total-trading-volume)
+)
+
+(define-read-only (get-trading-fee-rate)
+  (var-get trading-fee-rate)
+)
+
+(define-read-only (get-next-listing-id)
+  (var-get next-listing-id)
+)
+
+(define-read-only (get-next-trade-id)
+  (var-get next-trade-id)
+)
+
 (define-private (is-member-check (member principal))
   (default-to false (map-get? members member))
 )
+
+
