@@ -1,0 +1,28 @@
+[project]
+name = 'Habitatdao'
+description = ''
+authors = []
+telemetry = true
+cache_dir = '.\.cache'
+requirements = []
+[contracts.Habitatdao]
+path = 'contracts/Habitatdao.clar'
+clarity_version = 3
+epoch = 3.1
+[contracts.PropertyInsurance]
+path = 'contracts/PropertyInsurance.clar'
+clarity_version = 3
+epoch = 3.1
+
+[contracts.MaintenanceScheduler]
+path = 'contracts/MaintenanceScheduler.clar'
+clarity_version = 3
+epoch = 3.1
+[repl.analysis]
+passes = ['check_checker']
+
+[repl.analysis.check_checker]
+strict = false
+trusted_sender = false
+trusted_caller = false
+callee_filter = false
